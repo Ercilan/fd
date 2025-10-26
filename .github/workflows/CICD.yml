@@ -1,8 +1,7 @@
-name: CICD
+name: Android Build
 
 env:
   CICD_INTERMEDIATES_DIR: "_cicd-intermediates"
-  MSRV_FEATURES: "--all-features"
 
 on:
   workflow_dispatch:
@@ -39,102 +38,44 @@ jobs:
       homepage: ${{ steps.crate_metadata.outputs.homepage }}
       msrv: ${{ steps.crate_metadata.outputs.msrv }}
 
-  ensure_cargo_fmt:
-    name: Ensure 'cargo fmt' has been run
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt
-    - uses: actions/checkout@v5
-    - run: cargo fmt -- --check
-
-  lint_check:
-    name: Ensure 'cargo clippy' has no warnings
-    runs-on: ubuntu-latest
-    steps:
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy
-    - uses: actions/checkout@v5
-    - run: cargo clippy --all-targets --all-features -- -Dwarnings
-
-  min_version:
-    name: Minimum supported rust version
-    runs-on: ubuntu-22.04
-    needs: crate_metadata
-    steps:
-    - name: Checkout source code
-      uses: actions/checkout@v5
-
-    - name: Install rust toolchain (v${{ needs.crate_metadata.outputs.msrv }})
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ needs.crate_metadata.outputs.msrv }}
-        components: clippy
-    - name: Run clippy (on minimum supported rust version to prevent warnings we can't fix)
-      run: cargo clippy --locked --all-targets ${{ env.MSRV_FEATURES }}
-    - name: Run tests
-      run: cargo test --locked ${{ env.MSRV_FEATURES }}
-
-  build:
-    name: ${{ matrix.job.target }} (${{ matrix.job.os }})
-    runs-on: ${{ matrix.job.os }}
+  android_build:
+    name: ${{ matrix.job.target }}
+    runs-on: ubuntu-24.04
     needs: crate_metadata
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { target: aarch64-unknown-linux-gnu   , os: ubuntu-24.04, use-cross: true }
-          - { target: aarch64-unknown-linux-musl  , os: ubuntu-24.04, use-cross: true }
-          - { target: arm-unknown-linux-gnueabihf , os: ubuntu-24.04, use-cross: true }
-          - { target: arm-unknown-linux-musleabihf, os: ubuntu-24.04, use-cross: true }
-          - { target: i686-pc-windows-msvc        , os: windows-2022                  }
-          - { target: i686-unknown-linux-gnu      , os: ubuntu-24.04, use-cross: true }
-          - { target: i686-unknown-linux-musl     , os: ubuntu-24.04, use-cross: true }
-          - { target: aarch64-apple-darwin        , os: macos-14                      }
-          - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
-          - { target: x86_64-pc-windows-msvc      , os: windows-2022                  }
-          - { target: aarch64-pc-windows-msvc     , os: windows-11-arm                }
-          - { target: x86_64-unknown-linux-gnu    , os: ubuntu-24.04, use-cross: true }
-          - { target: x86_64-unknown-linux-musl   , os: ubuntu-24.04, use-cross: true }
-    env:
-      BUILD_CMD: cargo
+          - { target: aarch64-linux-android }
+          - { target: armv7-linux-androideabi }
+          - { target: x86_64-linux-android }
+          - { target: i686-linux-android }
     steps:
     - name: Checkout source code
       uses: actions/checkout@v5
-
-    - name: Install prerequisites
-      shell: bash
-      run: |
-        case ${{ matrix.job.target }} in
-          arm-unknown-linux-*) sudo apt-get -y update ; sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
-          aarch64-unknown-linux-gnu) sudo apt-get -y update ; sudo apt-get -y install gcc-aarch64-linux-gnu ;;
-        esac
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.job.target }}
-        # On windows, for now build with 1.77.2, so that it works on windows 7.
-        # When we update the MSRV again, we'll need to revisit this, and probably drop support for Win7
-        toolchain: "${{ contains(matrix.job.target, 'windows-') && '1.77.2' || 'stable' }}"
 
-    - name: Install cross
-      if: matrix.job.use-cross
-      uses: taiki-e/install-action@v2
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
       with:
-        tool: cross
+        ndk-version: r27d
+        add-to-path: false
 
-    - name: Overwrite build command env variable
-      if: matrix.job.use-cross
-      shell: bash
-      run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
 
-    - name: Show version information (Rust, cargo, GCC)
-      shell: bash
+    - name: Set Android NDK environment
       run: |
-        gcc --version || true
+        NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+        echo "ANDROID_NDK_HOME=${NDK_HOME}" >> $GITHUB_ENV
+
+    - name: Show version information
+      run: |
         rustup -V
         rustup toolchain list
         rustup default
@@ -142,52 +83,21 @@ jobs:
         rustc -V
 
     - name: Build
-      shell: bash
-      run: $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
+      run: cargo ndk --target ${{ matrix.job.target }} --platform 24 -- build --locked --release
 
     - name: Set binary name & path
       id: bin
-      shell: bash
       run: |
-        # Figure out suffix of binary
-        EXE_suffix=""
-        case ${{ matrix.job.target }} in
-          *-pc-windows-*) EXE_suffix=".exe" ;;
-        esac;
-
-        # Setup paths
-        BIN_NAME="${{ needs.crate_metadata.outputs.name }}${EXE_suffix}"
+        BIN_NAME="${{ needs.crate_metadata.outputs.name }}"
         BIN_PATH="target/${{ matrix.job.target }}/release/${BIN_NAME}"
-
-        # Let subsequent steps know where to find the binary
         echo "BIN_PATH=${BIN_PATH}" >> $GITHUB_OUTPUT
         echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_OUTPUT
 
-    - name: Set testing options
-      id: test-options
-      shell: bash
-      run: |
-        # test only library unit tests and binary for arm-type targets
-        unset CARGO_TEST_OPTIONS
-        unset CARGO_TEST_OPTIONS ; case ${{ matrix.job.target }} in arm-* | aarch64-*) CARGO_TEST_OPTIONS="--bin ${{ needs.crate_metadata.outputs.name }}" ;; esac;
-        echo "CARGO_TEST_OPTIONS=${CARGO_TEST_OPTIONS}" >> $GITHUB_OUTPUT
-
-    - name: Run tests
-      shell: bash
-      run: $BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}}
-
-    - name: Generate completions
-      id: completions
-      shell: bash
-      run: make completions
-
     - name: Create tarball
       id: package
-      shell: bash
       run: |
-        PKG_suffix=".tar.gz" ; case ${{ matrix.job.target }} in *-pc-windows-*) PKG_suffix=".zip" ;; esac;
         PKG_BASENAME=${{ needs.crate_metadata.outputs.name }}-v${{ needs.crate_metadata.outputs.version }}-${{ matrix.job.target }}
-        PKG_NAME=${PKG_BASENAME}${PKG_suffix}
+        PKG_NAME=${PKG_BASENAME}.tar.gz
         echo "PKG_NAME=${PKG_NAME}" >> $GITHUB_OUTPUT
 
         PKG_STAGING="${{ env.CICD_INTERMEDIATES_DIR }}/package"
@@ -200,32 +110,12 @@ jobs:
         # README, LICENSE and CHANGELOG files
         cp "README.md" "LICENSE-MIT" "LICENSE-APACHE" "CHANGELOG.md" "$ARCHIVE_DIR"
 
-        # Man page
-        cp 'doc/${{ needs.crate_metadata.outputs.name }}.1' "$ARCHIVE_DIR"
-
-        # Autocompletion files
-        cp -r autocomplete "${ARCHIVE_DIR}"
-
-        # base compressed package
+        # Create compressed package
         pushd "${PKG_STAGING}/" >/dev/null
-        case ${{ matrix.job.target }} in
-          *-pc-windows-*) 7z -y a "${PKG_NAME}" "${PKG_BASENAME}"/* | tail -2 ;;
-          *) tar czf "${PKG_NAME}" "${PKG_BASENAME}"/* ;;
-        esac;
+        tar czf "${PKG_NAME}" "${PKG_BASENAME}"/*
         popd >/dev/null
 
-        # Let subsequent steps know where to find the compressed package
         echo "PKG_PATH=${PKG_STAGING}/${PKG_NAME}" >> $GITHUB_OUTPUT
-
-    - name: Create Debian package
-      id: debian-package
-      shell: bash
-      if: startsWith(matrix.job.os, 'ubuntu')
-      run: bash scripts/create-deb.sh
-      env:
-        TARGET: ${{ matrix.job.target }}
-        DPKG_VERSION: ${{ needs.crate_metadata.version }}
-        BIN_PATH: ${{ steps.bin.outputs.BIN_PATH }}
 
     - name: "Artifact upload: tarball"
       id: upload-tarball
@@ -234,17 +124,8 @@ jobs:
         name: ${{ steps.package.outputs.PKG_NAME }}
         path: ${{ steps.package.outputs.PKG_PATH }}
 
-    - name: "Artifact upload: Debian package"
-      id: upload-deb
-      uses: actions/upload-artifact@master
-      if: steps.debian-package.outputs.DPKG_NAME
-      with:
-        name: ${{ steps.debian-package.outputs.DPKG_NAME }}
-        path: ${{ steps.debian-package.outputs.DPKG_PATH }}
-
     - name: Check for release
       id: is-release
-      shell: bash
       run: |
         unset IS_RELEASE ; if [[ $GITHUB_REF =~ ^refs/tags/v[0-9].* ]]; then IS_RELEASE='true' ; fi
         echo "IS_RELEASE=${IS_RELEASE}" >> $GITHUB_OUTPUT
@@ -254,33 +135,13 @@ jobs:
       if: steps.is-release.outputs.IS_RELEASE
       with:
         subject-name: ${{ steps.package.outputs.PKG_NAME }}
-        subject-digest: sha256::${{ steps.upload-tarball.artifact-digest }}
+        subject-digest: sha256:${{ steps.upload-tarball.outputs.artifact-digest }}
 
-    - name: "Attest artifact: Debian package"
-      uses: actions/attest-build-provenance@v3
-      if: 'steps.is-release.outputs.IS_RELEASE && steps.debian-package.outputs.DPKG_NAME'
-      with:
-        subject-name: ${{ steps.debian-package.outputs.DPKG_NAME }}
-        subject-digest: sha256::${{ steps.upload-deb.outputs.artifact-digest }}
-
-    - name: Publish archives and packages
+    - name: Publish archives
       uses: softprops/action-gh-release@v2
       if: steps.is-release.outputs.IS_RELEASE
       with:
         files: |
           ${{ steps.package.outputs.PKG_PATH }}
-          ${{ steps.debian-package.outputs.DPKG_PATH }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  winget:
-    name: Publish to Winget
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: vedantmgoyal2009/winget-releaser@v2
-        with:
-          identifier: sharkdp.fd
-          installers-regex: '-pc-windows-msvc\.zip$'
-          token: ${{ secrets.WINGET_TOKEN }}
